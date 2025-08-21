@@ -1,0 +1,16 @@
+{
+  "name": "mon20-indexer-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "indexer": "node indexer.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "sqlite3": "^5.1.6",
+    "ethers": "^6.15.0"
+  }
+}
