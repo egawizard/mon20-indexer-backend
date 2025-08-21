@@ -1,174 +1,149 @@
 import express from "express";
 import cors from "cors";
 import sqlite3 from "sqlite3";
+import { open } from "sqlite";
 import { ethers } from "ethers";
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+app.use(cors());
 
-// RPC list
+let db;
+const START_BLOCK = 32111409;
+const BATCH_SIZE = 50;
+
+// ==== RPC LIST ====
 const RPCS = [
   "https://rpc.ankr.com/monad_testnet",
   "https://testnet-rpc.monad.xyz"
 ];
-let provider = new ethers.JsonRpcProvider(RPCS[0]);
+let rpcIndex = 0;
+let provider = new ethers.JsonRpcProvider(RPCS[rpcIndex]);
 
-// Token config
-const DEPLOY_BLOCK = 32111409;
-const BATCH_SIZE = 50;
-const TICK = "MONS";
-const MINT_LIMIT = 1000;
-const MAX_SUPPLY = 21_000_000;
-
-// ===== DB INIT =====
-const db = new sqlite3.Database("./db.sqlite");
-
-db.serialize(() => {
-  db.run(`
-    CREATE TABLE IF NOT EXISTS stats (
-      id INTEGER PRIMARY KEY,
-      totalMinted INTEGER,
-      mintCount INTEGER,
-      lastBlock INTEGER
-    )
-  `);
-
-  db.run(`
-    CREATE TABLE IF NOT EXISTS holders (
-      address TEXT PRIMARY KEY,
-      balance INTEGER
-    )
-  `);
-
-  db.get("SELECT * FROM stats WHERE id=1", (err, row) => {
-    if (!row) {
-      db.run(
-        "INSERT INTO stats (id,totalMinted,mintCount,lastBlock) VALUES (1,0,0,?)",
-        DEPLOY_BLOCK - 1
-      );
-    }
-  });
-});
-
-// ===== API =====
-app.use(cors());
-
-app.get("/", (req, res) => {
-  res.json({ status: "ok", msg: "MON20 Indexer API" });
-});
-
-app.get("/stats", (req, res) => {
-  db.get("SELECT * FROM stats WHERE id=1", (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(row || {});
-  });
-});
-
-app.get("/holders", (req, res) => {
-  db.all(
-    "SELECT address, balance FROM holders ORDER BY balance DESC LIMIT 20",
-    (err, rows) => {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json(rows);
-    }
-  );
-});
-
-// ===== Indexer =====
-async function processBlock(bn) {
-  try {
-    const block = await provider.send("eth_getBlockByNumber", [
-      ethers.toBeHex(bn),
-      true
-    ]);
-    if (!block || !block.transactions) return;
-
-    for (const tx of block.transactions) {
-      if (!tx.input || tx.input === "0x") continue;
-      if (tx.from.toLowerCase() !== tx.to?.toLowerCase()) continue;
-
-      try {
-        const hex = tx.input.startsWith("0x") ? tx.input.slice(2) : tx.input;
-        let str = "";
-        for (let i = 0; i < hex.length; i += 2) {
-          str += String.fromCharCode(parseInt(hex.substr(i, 2), 16));
-        }
-        const json = JSON.parse(str);
-
-        if (
-          (json.p || "").toUpperCase() === "MON-20" &&
-          (json.op || "").toLowerCase() === "mint" &&
-          (json.tick || "") === TICK &&
-          String(json.amt || "") === String(MINT_LIMIT)
-        ) {
-          db.get("SELECT * FROM stats WHERE id=1", (err, stats) => {
-            if (!stats || stats.totalMinted + MINT_LIMIT > MAX_SUPPLY) return;
-
-            const addr = tx.from.toLowerCase();
-            db.get(
-              "SELECT balance FROM holders WHERE address=?",
-              [addr],
-              (err, prev) => {
-                if (prev) {
-                  db.run("UPDATE holders SET balance=? WHERE address=?", [
-                    prev.balance + MINT_LIMIT,
-                    addr
-                  ]);
-                } else {
-                  db.run(
-                    "INSERT INTO holders (address,balance) VALUES (?,?)",
-                    [addr, MINT_LIMIT]
-                  );
-                }
-
-                db.run(
-                  "UPDATE stats SET totalMinted=?, mintCount=?, lastBlock=? WHERE id=1",
-                  stats.totalMinted + MINT_LIMIT,
-                  stats.mintCount + 1,
-                  bn
-                );
-              }
-            );
-          });
-        }
-      } catch {}
-    }
-
-    db.run("UPDATE stats SET lastBlock=? WHERE id=1", bn);
-  } catch (e) {
-    console.log("Block error", bn, e.message);
-  }
+function switchRPC() {
+  rpcIndex = (rpcIndex + 1) % RPCS.length;
+  provider = new ethers.JsonRpcProvider(RPCS[rpcIndex]);
+  console.log(`🔄 Switched RPC to ${RPCS[rpcIndex]}`);
 }
 
+// ==== API ROUTES ====
+app.get("/stats", async (req, res) => {
+  const stats = await db.get("SELECT * FROM stats WHERE id = 1");
+  res.json(stats || { totalMinted: 0, mintCount: 0, lastBlock: START_BLOCK });
+});
+
+app.get("/holders", async (req, res) => {
+  const holders = await db.all(
+    "SELECT * FROM holders ORDER BY balance DESC LIMIT 50"
+  );
+  res.json(holders);
+});
+
+// ==== MAIN INDEXER LOOP ====
 async function mainLoop() {
   while (true) {
     try {
-      db.get("SELECT * FROM stats WHERE id=1", async (err, stats) => {
-        const latest = await provider.getBlockNumber();
-        if (latest > stats.lastBlock) {
-          console.log(`📡 Syncing from ${stats.lastBlock + 1} to ${latest}`);
-          for (let b = stats.lastBlock + 1; b <= latest; b += BATCH_SIZE) {
-            const end = Math.min(b + BATCH_SIZE - 1, latest);
-            for (let x = b; x <= end; x++) {
-              await processBlock(x);
-            }
-            console.log(`📦 Synced block ${end}`);
-            await new Promise((r) => setTimeout(r, 500));
+      const stats = await db.get("SELECT * FROM stats WHERE id = 1");
+      let fromBlock = stats ? stats.lastBlock : START_BLOCK;
+      const latestBlock = await provider.getBlockNumber();
+
+      if (fromBlock >= latestBlock) {
+        console.log("✅ Up to date, waiting 5s...");
+        await new Promise(r => setTimeout(r, 5000));
+        continue;
+      }
+
+      const toBlock = Math.min(fromBlock + BATCH_SIZE, latestBlock);
+      console.log(`📡 Syncing from ${fromBlock} to ${toBlock}`);
+
+      for (let b = fromBlock; b <= toBlock; b++) {
+        try {
+          const block = await provider.getBlock(b, true);
+
+          if (!block || !block.transactions) continue;
+
+          for (const tx of block.transactions) {
+            if (!tx.input || tx.input === "0x") continue;
+            const data = Buffer.from(tx.input.slice(2), "hex").toString("utf8");
+
+            try {
+              const parsed = JSON.parse(data);
+
+              if (parsed.p && parsed.op) {
+                if (parsed.op === "mint" && parsed.tick === "MONS") {
+                  await db.run(
+                    `INSERT INTO holders (address, balance)
+                     VALUES (?, ?)
+                     ON CONFLICT(address) DO UPDATE SET balance = balance + ?`,
+                    [tx.from, parseInt(parsed.amt), parseInt(parsed.amt)]
+                  );
+                  await db.run(
+                    `UPDATE stats SET totalMinted = totalMinted + ?, mintCount = mintCount + 1, lastBlock = ? WHERE id = 1`,
+                    [parseInt(parsed.amt), b]
+                  );
+                  console.log(`✅ Mint detected from ${tx.from} amount ${parsed.amt}`);
+                }
+              }
+            } catch {}
+          }
+        } catch (err) {
+          // 🔄 Handle rate limit / RPC error
+          if (
+            err.message.includes("rate limit") ||
+            err.message.includes("Too many requests")
+          ) {
+            console.log("⚠️ Rate limited! Switching RPC...");
+            switchRPC();
+            await new Promise(r => setTimeout(r, 10000));
+            break; // keluar dari batch
+          } else {
+            console.log(`Block error ${b}:`, err.message);
           }
         }
-      });
-      await new Promise((r) => setTimeout(r, 5000));
+      }
     } catch (e) {
-      console.log("Main loop error", e.message);
-      provider = new ethers.JsonRpcProvider(
-        RPCS[Math.floor(Math.random() * RPCS.length)]
-      );
-      await new Promise((r) => setTimeout(r, 5000));
+      console.log("Main loop error:", e.message);
+      switchRPC();
+      await new Promise(r => setTimeout(r, 5000));
     }
   }
 }
 
-app.listen(PORT, () => {
-  console.log(`🚀 API running on :${PORT}`);
+// ==== INIT ====
+async function init() {
+  db = await open({
+    filename: "./db.sqlite",
+    driver: sqlite3.Database
+  });
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS stats (
+      id INTEGER PRIMARY KEY,
+      totalMinted INTEGER DEFAULT 0,
+      mintCount INTEGER DEFAULT 0,
+      lastBlock INTEGER DEFAULT ${START_BLOCK}
+    )
+  `);
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS holders (
+      address TEXT PRIMARY KEY,
+      balance INTEGER DEFAULT 0
+    )
+  `);
+
+  const stats = await db.get("SELECT * FROM stats WHERE id = 1");
+  if (!stats) {
+    await db.run(
+      "INSERT INTO stats (id, totalMinted, mintCount, lastBlock) VALUES (1, 0, 0, ?)",
+      [START_BLOCK]
+    );
+  }
+
+  app.listen(8080, () => {
+    console.log("🚀 API running on :8080");
+  });
+
   mainLoop();
-});
+}
+
+init();
