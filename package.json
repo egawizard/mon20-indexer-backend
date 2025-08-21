@@ -1,15 +1,16 @@
 {
   "name": "mon20-indexer-backend",
   "version": "1.0.0",
+  "description": "MON-20 Indexer Backend for Monad Testnet",
   "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
     "cors": "^2.8.5",
-    "sqlite3": "^5.1.6",
-    "ethers": "^6.15.0"
+    "ethers": "^6.15.0",
+    "express": "^4.19.2",
+    "sqlite3": "^5.1.6"
   }
 }
