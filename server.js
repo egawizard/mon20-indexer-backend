@@ -1,7 +1,6 @@
 import express from "express";
 import cors from "cors";
 import sqlite3 from "sqlite3";
-import { open } from "sqlite";
 import { ethers } from "ethers";
 
 const app = express();
@@ -176,3 +175,4 @@ app.listen(PORT, () => {
   console.log(`🚀 API running on :${PORT}`);
   mainLoop();
 });
+
