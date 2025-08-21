@@ -21,63 +21,57 @@ const MINT_LIMIT = 1000;
 const MAX_SUPPLY = 21_000_000;
 
 // ===== DB INIT =====
-let db;
-(async () => {
-  db = await open({
-    filename: "./db.sqlite",
-    driver: sqlite3.Database
-  });
+const db = new sqlite3.Database("./db.sqlite");
 
-  await db.exec(`
+db.serialize(() => {
+  db.run(`
     CREATE TABLE IF NOT EXISTS stats (
       id INTEGER PRIMARY KEY,
       totalMinted INTEGER,
       mintCount INTEGER,
       lastBlock INTEGER
-    );
+    )
   `);
 
-  await db.exec(`
+  db.run(`
     CREATE TABLE IF NOT EXISTS holders (
       address TEXT PRIMARY KEY,
       balance INTEGER
-    );
+    )
   `);
 
-  const row = await db.get("SELECT * FROM stats WHERE id=1");
-  if (!row) {
-    await db.run(
-      "INSERT INTO stats (id,totalMinted,mintCount,lastBlock) VALUES (1,0,0,?)",
-      DEPLOY_BLOCK - 1
-    );
-  }
-})();
-
-app.use(cors());
+  db.get("SELECT * FROM stats WHERE id=1", (err, row) => {
+    if (!row) {
+      db.run(
+        "INSERT INTO stats (id,totalMinted,mintCount,lastBlock) VALUES (1,0,0,?)",
+        DEPLOY_BLOCK - 1
+      );
+    }
+  });
+});
 
 // ===== API =====
+app.use(cors());
+
 app.get("/", (req, res) => {
   res.json({ status: "ok", msg: "MON20 Indexer API" });
 });
 
-app.get("/stats", async (req, res) => {
-  try {
-    const row = await db.get("SELECT * FROM stats WHERE id=1");
+app.get("/stats", (req, res) => {
+  db.get("SELECT * FROM stats WHERE id=1", (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
     res.json(row || {});
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  });
 });
 
-app.get("/holders", async (req, res) => {
-  try {
-    const rows = await db.all(
-      "SELECT address, balance FROM holders ORDER BY balance DESC LIMIT 20"
-    );
-    res.json(rows);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+app.get("/holders", (req, res) => {
+  db.all(
+    "SELECT address, balance FROM holders ORDER BY balance DESC LIMIT 20",
+    (err, rows) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json(rows);
+    }
+  );
 });
 
 // ===== Indexer =====
@@ -107,36 +101,40 @@ async function processBlock(bn) {
           (json.tick || "") === TICK &&
           String(json.amt || "") === String(MINT_LIMIT)
         ) {
-          const stats = await db.get("SELECT * FROM stats WHERE id=1");
-          if (stats.totalMinted + MINT_LIMIT > MAX_SUPPLY) return;
+          db.get("SELECT * FROM stats WHERE id=1", (err, stats) => {
+            if (!stats || stats.totalMinted + MINT_LIMIT > MAX_SUPPLY) return;
 
-          const addr = tx.from.toLowerCase();
-          const prev = await db.get(
-            "SELECT balance FROM holders WHERE address=?",
-            addr
-          );
-          if (prev) {
-            await db.run("UPDATE holders SET balance=? WHERE address=?", [
-              prev.balance + MINT_LIMIT,
-              addr
-            ]);
-          } else {
-            await db.run("INSERT INTO holders (address,balance) VALUES (?,?)", [
-              addr,
-              MINT_LIMIT
-            ]);
-          }
+            const addr = tx.from.toLowerCase();
+            db.get(
+              "SELECT balance FROM holders WHERE address=?",
+              [addr],
+              (err, prev) => {
+                if (prev) {
+                  db.run("UPDATE holders SET balance=? WHERE address=?", [
+                    prev.balance + MINT_LIMIT,
+                    addr
+                  ]);
+                } else {
+                  db.run(
+                    "INSERT INTO holders (address,balance) VALUES (?,?)",
+                    [addr, MINT_LIMIT]
+                  );
+                }
 
-          await db.run(
-            "UPDATE stats SET totalMinted=?, mintCount=?, lastBlock=? WHERE id=1",
-            stats.totalMinted + MINT_LIMIT,
-            stats.mintCount + 1,
-            bn
-          );
+                db.run(
+                  "UPDATE stats SET totalMinted=?, mintCount=?, lastBlock=? WHERE id=1",
+                  stats.totalMinted + MINT_LIMIT,
+                  stats.mintCount + 1,
+                  bn
+                );
+              }
+            );
+          });
         }
       } catch {}
     }
-    await db.run("UPDATE stats SET lastBlock=? WHERE id=1", bn);
+
+    db.run("UPDATE stats SET lastBlock=? WHERE id=1", bn);
   } catch (e) {
     console.log("Block error", bn, e.message);
   }
@@ -145,20 +143,20 @@ async function processBlock(bn) {
 async function mainLoop() {
   while (true) {
     try {
-      const stats = await db.get("SELECT * FROM stats WHERE id=1");
-      const latest = await provider.getBlockNumber();
-
-      if (latest > stats.lastBlock) {
-        console.log(`📡 Syncing from ${stats.lastBlock + 1} to ${latest}`);
-        for (let b = stats.lastBlock + 1; b <= latest; b += BATCH_SIZE) {
-          const end = Math.min(b + BATCH_SIZE - 1, latest);
-          for (let x = b; x <= end; x++) {
-            await processBlock(x);
+      db.get("SELECT * FROM stats WHERE id=1", async (err, stats) => {
+        const latest = await provider.getBlockNumber();
+        if (latest > stats.lastBlock) {
+          console.log(`📡 Syncing from ${stats.lastBlock + 1} to ${latest}`);
+          for (let b = stats.lastBlock + 1; b <= latest; b += BATCH_SIZE) {
+            const end = Math.min(b + BATCH_SIZE - 1, latest);
+            for (let x = b; x <= end; x++) {
+              await processBlock(x);
+            }
+            console.log(`📦 Synced block ${end}`);
+            await new Promise((r) => setTimeout(r, 500));
           }
-          console.log(`📦 Synced block ${end}`);
-          await new Promise((r) => setTimeout(r, 500));
         }
-      }
+      });
       await new Promise((r) => setTimeout(r, 5000));
     } catch (e) {
       console.log("Main loop error", e.message);
@@ -170,9 +168,7 @@ async function mainLoop() {
   }
 }
 
-// Start server + indexer
 app.listen(PORT, () => {
   console.log(`🚀 API running on :${PORT}`);
   mainLoop();
 });
-
